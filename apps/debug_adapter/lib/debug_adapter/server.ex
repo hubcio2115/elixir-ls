@@ -102,7 +102,7 @@ defmodule ElixirLS.DebugAdapter.Server do
 
         env = unquote(env_with_line_from_asts(first_ast_chunk))
 
-        next? = unquote(__MODULE__).pry_with_next(true, binding(), env)
+        next? = unquote(__MODULE__).__next__(true, binding(), env)
         value = unquote(pipe_chunk_of_asts(first_ast_chunk))
 
         unquote(__MODULE__).__dbg_pipe_step__(
@@ -121,7 +121,7 @@ defmodule ElixirLS.DebugAdapter.Server do
         quote do
           unquote(ast_acc)
           env = unquote(env_with_line_from_asts(asts_chunk))
-          next? = unquote(__MODULE__).pry_with_next(next?, binding(), env)
+          next? = unquote(__MODULE__).__next__(next?, binding(), env)
           value = unquote(piped_asts)
 
           unquote(__MODULE__).__dbg_pipe_step__(
@@ -142,7 +142,7 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
-  def pry_with_next(next?, binding, opts_or_env) when is_boolean(next?) do
+  def __next__(next?, binding, opts_or_env) when is_boolean(next?) do
     if next? do
       {:current_stacktrace, stacktrace} = Process.info(self(), :current_stacktrace)
 
@@ -401,6 +401,19 @@ defmodule ElixirLS.DebugAdapter.Server do
       "elixir_ls.dap_request_time" => 0
     })
 
+    if state.config["request"] == "attach" do
+      # we need to clean up before we disconnect
+      Output.debugger_console("Disabling all breakpoints")
+      :int.no_break()
+      :int.auto_attach(false)
+
+      # do not leave interpreted modules on remote nodes
+      for module <- :int.interpreted() do
+        Output.debugger_console("Uninterpreting module #{inspect(module)}")
+        :int.nn(module)
+      end
+    end
+
     {:noreply, state, {:continue, :disconnect}}
   end
 
@@ -487,8 +500,18 @@ defmodule ElixirLS.DebugAdapter.Server do
       when event in [:breakpoint_reached, :paused] do
     # when debugged pid exits we get another breakpoint reached message (at least on OTP 23)
     # check if process is alive to not debug dead ones
+
+    alive? =
+      try do
+        Process.alive?(pid)
+      rescue
+        ArgumentError ->
+          # Process.alive?(pid) raises ArgumentError for remote pids, assume alive
+          true
+      end
+
     state =
-      if Process.alive?(pid) do
+      if alive? do
         # monitor to cleanup state if process dies
         ref = Process.monitor(pid)
         {state, thread_id, _new_ids} = ensure_thread_id(state, pid, [])
@@ -497,6 +520,7 @@ defmodule ElixirLS.DebugAdapter.Server do
         state = put_in(state.paused_processes[pid], paused_process)
 
         reason = get_stop_reason(state, event, paused_process.stack)
+
         body = %{"reason" => reason, "threadId" => thread_id, "allThreadsStopped" => false}
         Output.send_event("stopped", body)
         state
@@ -606,12 +630,28 @@ defmodule ElixirLS.DebugAdapter.Server do
     {:noreply, state}
   end
 
+  def handle_info({:nodeup, node, %{node_type: node_type}}, state = %__MODULE__{}) do
+    Output.debugger_console("#{node_type} node #{node} connected\n")
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:nodedown, node, %{node_type: node_type, nodedown_reason: nodedown_reason}},
+        state = %__MODULE__{}
+      ) do
+    Output.debugger_console(
+      "#{node_type} node #{node} disconnected: #{inspect(nodedown_reason)}\n"
+    )
+
+    {:noreply, state}
+  end
+
   # If we get the disconnect request from the client, we continue with :disconnect so the server will
   # die right after responding to the request
   @impl GenServer
   def handle_continue(:disconnect, state = %__MODULE__{}) do
     unless :persistent_term.get(:debug_adapter_test_mode, false) do
-      Output.debugger_console("Received disconnect request")
+      Output.debugger_console("Received disconnect request\n")
       Process.sleep(200)
       System.stop(0)
     else
@@ -779,6 +819,90 @@ defmodule ElixirLS.DebugAdapter.Server do
     {%{}, %{state | config: config}}
   end
 
+  defp handle_request(attach_req(_, config), state = %__MODULE__{}) do
+    server = self()
+
+    :net_kernel.monitor_nodes(true, %{
+      connection_id: false,
+      node_type: :all,
+      nodedown_reason: true
+    })
+
+    {_, ref} = spawn_monitor(fn -> attach(config, server) end)
+
+    config =
+      receive do
+        {:ok, config} ->
+          # sending `initialized` signals that we are ready to receive configuration requests
+          # setBreakpoints, setFunctionBreakpoints and configurationDone
+          Output.send_event("initialized", %{})
+          send(self(), :update_threads)
+
+          Output.telemetry(
+            "dap_attach_config",
+            %{
+              "elixir_ls.debugAutoInterpretAllModules" =>
+                to_string(Map.get(config, "debugAutoInterpretAllModules", true)),
+              "elixir_ls.stackTraceMode" =>
+                to_string(Map.get(config, "stackTraceMode", "no_tail")),
+              "elixir_ls.noDebug" => to_string(Map.get(config, "noDebug", false)),
+              "elixir_ls.env" => to_string(Map.get(config, "env", %{}) != %{}),
+              "elixir_ls.debugInterpretModulesPatterns" =>
+                to_string(Map.get(config, "debugInterpretModulesPatterns", []) != []),
+              "elixir_ls.excludeModules" => to_string(Map.get(config, "excludeModules", []) != [])
+            },
+            %{}
+          )
+
+          config
+
+        {:DOWN, ^ref, :process, _pid, reason} ->
+          case reason do
+            :normal ->
+              :ok
+
+            {%ServerError{} = error, stack} ->
+              Output.send_event("terminated", %{"restart" => false})
+
+              reraise error, stack
+
+            _other ->
+              message = "Attach request failed with reason\n" <> Exception.format_exit(reason)
+
+              Output.debugger_console(message)
+
+              Output.send_event("terminated", %{"restart" => false})
+
+              raise ServerError,
+                message: "attachError",
+                format: message,
+                variables: %{},
+                send_telemetry: false,
+                show_user: true
+          end
+      end
+
+    {%{}, %{state | config: config}}
+  end
+
+  defp handle_request(
+         source_req(_, args),
+         state = %__MODULE__{}
+       ) do
+    path = args["source"]["path"]
+
+    content =
+      if path == "replinput" do
+        # this is a special path that VSCode uses for debugger console
+        # return an empty string as we do not need anything there
+        ""
+      else
+        File.read!(path)
+      end
+
+    {%{"content" => content}, state}
+  end
+
   defp handle_request(
          set_breakpoints_req(_, %{"path" => _path}, _breakpoints),
          %__MODULE__{config: %{"noDebug" => true}}
@@ -810,7 +934,7 @@ defmodule ElixirLS.DebugAdapter.Server do
       BreakpointCondition.unregister_condition(module, [line])
     end
 
-    result = set_breakpoints(path, new_lines |> Enum.zip(new_conditions))
+    result = set_breakpoints(path, new_lines |> Enum.zip(new_conditions), state.config)
     new_bps = for {:ok, modules, line} <- result, do: {modules, line}
 
     state =
@@ -823,7 +947,7 @@ defmodule ElixirLS.DebugAdapter.Server do
     breakpoints_json =
       Enum.map(result, fn
         {:ok, _, _} -> %{"verified" => true}
-        {:error, error} -> %{"verified" => false, "message" => error}
+        {:error, error} -> %{"verified" => false, "message" => error, "reason" => "failed"}
       end)
 
     {%{"breakpoints" => breakpoints_json}, state}
@@ -890,7 +1014,14 @@ defmodule ElixirLS.DebugAdapter.Server do
                             lines = for {{^m, line}, _} <- breaks_after -- breaks_before, do: line
 
                             # pass nil as log_message - not supported on function breakpoints as of DAP 1.63
-                            update_break_condition(m, lines, condition, nil, hit_count)
+                            update_break_condition(
+                              m,
+                              lines,
+                              condition,
+                              nil,
+                              hit_count,
+                              state.config
+                            )
 
                             {:ok, lines}
 
@@ -911,7 +1042,7 @@ defmodule ElixirLS.DebugAdapter.Server do
 
                   lines ->
                     # pass nil as log_message - not supported on function breakpoints as of DAP 1.51
-                    update_break_condition(m, lines, condition, nil, hit_count)
+                    update_break_condition(m, lines, condition, nil, hit_count, state.config)
 
                     {:ok, lines}
                 end
@@ -930,12 +1061,15 @@ defmodule ElixirLS.DebugAdapter.Server do
       Enum.map(mfas, fn
         {{:ok, mfa}, _} ->
           case results[mfa] do
-            {:ok, _} -> %{"verified" => true}
-            {:error, error} -> %{"verified" => false, "message" => inspect(error)}
+            {:ok, _} ->
+              %{"verified" => true}
+
+            {:error, error} ->
+              %{"verified" => false, "message" => inspect(error), "reason" => "failed"}
           end
 
         {{:error, error}, _} ->
-          %{"verified" => false, "message" => error}
+          %{"verified" => false, "message" => error, "reason" => "failed"}
       end)
 
     {%{"breakpoints" => breakpoints_json}, state}
@@ -952,13 +1086,14 @@ defmodule ElixirLS.DebugAdapter.Server do
   end
 
   defp handle_request(threads_req(_), state = %__MODULE__{}) do
-    {state, thread_ids} = update_threads(state)
+    snapshot_by_pid = get_snapshot_by_pid()
+    {state, thread_ids} = update_threads(state, snapshot_by_pid)
 
     threads =
       for thread_id <- thread_ids,
           pid = state.thread_ids_to_pids[thread_id],
-          (process_info = Process.info(pid)) != nil do
-        full_name = "#{process_name(process_info)} #{:erlang.pid_to_list(pid)}"
+          (process_name = get_process_name(pid, snapshot_by_pid)) != nil do
+        full_name = "#{process_name} #{:erlang.pid_to_list(pid)}"
         %{"id" => thread_id, "name" => full_name}
       end
       |> Enum.sort_by(fn %{"name" => name} -> name end)
@@ -1058,6 +1193,7 @@ defmodule ElixirLS.DebugAdapter.Server do
 
           vars_scope = %{
             "name" => "variables",
+            "presentationHint" => "locals",
             "variablesReference" => bindings_id,
             "namedVariables" => Enum.count(frame.bindings),
             "indexedVariables" => 0,
@@ -1083,11 +1219,21 @@ defmodule ElixirLS.DebugAdapter.Server do
           {state, vars_id} = ensure_var_id(state, pid, variables)
           {state, versioned_vars_id} = ensure_var_id(state, pid, frame.bindings)
           {state, messages_id} = ensure_var_id(state, pid, frame.messages)
-          process_info = Process.info(pid)
+
+          process_info =
+            try do
+              Process.info(pid)
+            rescue
+              ArgumentError ->
+                # remote pid
+                []
+            end
+
           {state, process_info_id} = ensure_var_id(state, pid, process_info)
 
           vars_scope = %{
             "name" => "variables",
+            "presentationHint" => "locals",
             "variablesReference" => vars_id,
             "namedVariables" => map_size(variables),
             "indexedVariables" => 0,
@@ -1096,6 +1242,7 @@ defmodule ElixirLS.DebugAdapter.Server do
 
           versioned_vars_scope = %{
             "name" => "versioned variables",
+            "presentationHint" => "locals",
             "variablesReference" => versioned_vars_id,
             "namedVariables" => Enum.count(frame.bindings),
             "indexedVariables" => 0,
@@ -1106,6 +1253,7 @@ defmodule ElixirLS.DebugAdapter.Server do
             if frame.args != :undefined do
               %{
                 "name" => "arguments",
+                "presentationHint" => "arguments",
                 "variablesReference" => args_id,
                 "namedVariables" => 0,
                 "indexedVariables" => Enum.count(frame.args),
@@ -1123,6 +1271,7 @@ defmodule ElixirLS.DebugAdapter.Server do
 
           process_info_scope = %{
             "name" => "process info",
+            "presentationHint" => "registers",
             "variablesReference" => process_info_id,
             "namedVariables" => length(process_info),
             "indexedVariables" => 0,
@@ -1730,9 +1879,6 @@ defmodule ElixirLS.DebugAdapter.Server do
       Mix.Task.run("loadconfig")
     end
 
-    # make sure ANSI is disabled
-    Application.put_env(:elixir, :ansi_enabled, false)
-
     unless "--no-compile" in task_args or "--no-mix-exs" in task_args do
       case Mix.Task.run("compile", ["--ignore-module-conflict", "--return-errors"]) do
         {:error, diagnostics} ->
@@ -1837,6 +1983,190 @@ defmodule ElixirLS.DebugAdapter.Server do
         variables: %{},
         send_telemetry: false,
         show_user: true
+  end
+
+  defp attach(config, server) do
+    remote_node = config["remoteNode"]
+
+    if not is_binary(remote_node) or remote_node == "" or not String.contains?(remote_node, "@") do
+      raise ServerError,
+        message: "argumentError",
+        format:
+          "Invalid `remoteNode` in launch config. Expected OTP node name, got #{inspect(remote_node)}",
+        variables: %{},
+        send_telemetry: false,
+        show_user: true
+    else
+      node_atom = String.to_atom(remote_node)
+
+      case Node.connect(node_atom) do
+        true ->
+          load_debugger_app(node_atom)
+
+        false ->
+          raise ServerError,
+            message: "runtimeError",
+            format: "Unable to connect to `remoteNode` #{inspect(remote_node)}",
+            variables: %{},
+            send_telemetry: false,
+            show_user: true
+      end
+    end
+
+    project_dir = config["projectDir"]
+
+    project_dir =
+      if project_dir not in [nil, ""] do
+        if not is_binary(project_dir) do
+          raise ServerError,
+            message: "argumentError",
+            format:
+              "Invalid `projectDir` in launch config. Expected string or nil, got #{inspect(project_dir)}",
+            variables: %{},
+            send_telemetry: false,
+            show_user: true
+        end
+
+        Output.debugger_console("Starting debugger in directory: #{project_dir}\n")
+        project_dir
+      else
+        cwd = File.cwd!()
+
+        Output.debugger_console(
+          "projectDir is not set, starting debugger in current directory: #{cwd}\n"
+        )
+
+        cwd
+      end
+
+    auto_interpret_files? = Map.get(config, "debugAutoInterpretAllModules", true)
+
+    set_env_vars(config["env"])
+
+    try do
+      File.cd!(project_dir)
+    rescue
+      e in File.Error ->
+        raise ServerError,
+          message: "argumentError",
+          format: Exception.format_banner(:error, e, __STACKTRACE__),
+          variables: %{},
+          send_telemetry: false,
+          show_user: true
+    end
+
+    # the startup sequence here is taken from
+    # https://github.com/elixir-lang/elixir/blob/v1.14.4/lib/mix/lib/mix/cli.ex#L158
+    # we assume that mix is already started and has archives and tasks loaded
+    Launch.reload_mix_env_and_target()
+
+    Launch.load_mix_exs([])
+
+    Mix.Task.run("loadconfig")
+
+    Mix.Task.run("loadpaths")
+
+    exclude_module_names =
+      config
+      |> Map.get("excludeModules", [])
+
+    if not (is_list(exclude_module_names) and Enum.all?(exclude_module_names, &is_binary/1)) do
+      raise ServerError,
+        message: "argumentError",
+        format:
+          "Invalid `excludeModules` in launch config. Expected list of strings or nil, got #{inspect(exclude_module_names)}",
+        variables: %{},
+        send_telemetry: false,
+        show_user: true
+    end
+
+    exclude_module_pattern =
+      exclude_module_names
+      |> Enum.map(&wildcard_module_name_to_pattern/1)
+
+    unless config["noDebug"] do
+      set_stack_trace_mode(config["stackTraceMode"])
+
+      if auto_interpret_files? do
+        auto_interpret_modules(Mix.Project.build_path(), exclude_module_pattern)
+      end
+
+      interpret_modules_patterns = Map.get(config, "debugInterpretModulesPatterns", [])
+
+      if not (is_list(interpret_modules_patterns) and
+                Enum.all?(interpret_modules_patterns, &is_binary/1)) do
+        raise ServerError,
+          message: "argumentError",
+          format:
+            "Invalid `debugInterpretModulesPatterns` in launch config. Expected list of strings or nil, got #{inspect(interpret_modules_patterns)}",
+          variables: %{},
+          send_telemetry: false,
+          show_user: true
+      end
+
+      interpret_specified_modules(interpret_modules_patterns, exclude_module_pattern)
+    else
+      Output.debugger_console("Running without debugging")
+    end
+
+    send(server, {:ok, config})
+  rescue
+    e in [
+      Mix.Error,
+      Mix.NoProjectError,
+      Mix.ElixirVersionError,
+      Mix.InvalidTaskError,
+      Mix.NoTaskError,
+      CompileError,
+      SyntaxError,
+      TokenMissingError
+    ] ->
+      raise ServerError,
+        message: "attachError",
+        format: Exception.format_banner(:error, e, __STACKTRACE__),
+        variables: %{},
+        send_telemetry: false,
+        show_user: true
+  end
+
+  defp load_debugger_app(node) do
+    Output.debugger_console("Loading debugger app on #{node}\n")
+
+    res =
+      case :rpc.call(node, Application, :load, [:debugger], 5000) do
+        :ok ->
+          :ok
+
+        {:error, {:already_loaded, :debugger}} ->
+          :ok
+
+        other ->
+          Output.debugger_console(
+            "Unable to load debugger app via Application.load on #{node}: #{inspect(other)}\n"
+          )
+
+          case :rpc.call(node, Mix, :ensure_application!, [:debugger], 5000) do
+            :ok ->
+              :ok
+
+            other ->
+              Output.debugger_console(
+                "Unable to load debugger app via Mix.ensure_application! on #{node}: #{inspect(other)}\n"
+              )
+
+              :error
+          end
+      end
+
+    case res do
+      :ok ->
+        Output.debugger_console("Debugger app loaded on #{node}\n")
+
+      :error ->
+        Output.debugger_important(
+          "Please make sure that OTP debugger application is installed and loadable on #{node}. You may need to include it in extra_applications.\n"
+        )
+    end
   end
 
   defp set_env_vars(env) when is_map(env) do
@@ -1953,7 +2283,7 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
-  defp launch_task(config) do
+  defp launch_task(config = %{"request" => "launch"}) do
     # This fixes a race condition in the tests and likely improves reliability when using the
     # debugger as well.
     Process.sleep(100)
@@ -1982,6 +2312,11 @@ defmodule ElixirLS.DebugAdapter.Server do
       Output.debugger_console("Sleeping. The debugger will need to be stopped manually.\n")
       Process.sleep(:infinity)
     end
+  end
+
+  defp launch_task(%{"request" => "attach"}) do
+    Output.debugger_console("Sleeping. The debugger will need to be stopped manually.\n")
+    Process.sleep(:infinity)
   end
 
   # Interpreting modules defined in .exs files requires that we first load the file and save any
@@ -2023,13 +2358,25 @@ defmodule ElixirLS.DebugAdapter.Server do
         end
       end)
 
-    ElixirSense.all_modules()
-    |> Enum.filter(fn module_name ->
-      Enum.find(regexes, fn regex ->
-        Regex.match?(regex, module_name)
+    if String.to_integer(System.otp_release()) >= 23 do
+      for {module_charlist, _beam_path, _loaded} <- :code.all_available(),
+          module = List.to_atom(module_charlist),
+          module_name = inspect(module),
+          Enum.any?(regexes, fn regex ->
+            Regex.match?(regex, module_name)
+          end) do
+        module
+      end
+    else
+      # TODO remove when we drop OTP 22 and elixir 1.13 support
+      ElixirSense.all_modules()
+      |> Enum.filter(fn module_name ->
+        Enum.find(regexes, fn regex ->
+          Regex.match?(regex, module_name)
+        end)
       end)
-    end)
-    |> Enum.map(fn module_name -> Module.concat(Elixir, module_name) end)
+      |> Enum.map(fn module_name -> Module.concat(Elixir, module_name) end)
+    end
     |> interpret_modules(exclude_module_pattern)
   end
 
@@ -2040,10 +2387,10 @@ defmodule ElixirLS.DebugAdapter.Server do
     :ok = interpret(module)
   end
 
-  defp set_breakpoints(path, lines) do
+  defp set_breakpoints(path, lines, config) do
     if Path.extname(path) == ".erl" do
       module = String.to_atom(Path.basename(path, ".erl"))
-      for line <- lines, do: set_breakpoint([module], path, line)
+      for line <- lines, do: set_breakpoint([module], path, line, config)
     else
       loaded_elixir_modules =
         :code.all_loaded()
@@ -2081,7 +2428,7 @@ defmodule ElixirLS.DebugAdapter.Server do
               loaded_modules_from_path
           end
 
-        set_breakpoint(modules_to_break, path, line)
+        set_breakpoint(modules_to_break, path, line, config)
       end
     end
   rescue
@@ -2089,11 +2436,11 @@ defmodule ElixirLS.DebugAdapter.Server do
       for _line <- lines, do: {:error, Exception.format_exit(error)}
   end
 
-  defp set_breakpoint([], path, {line, _}) do
+  defp set_breakpoint([], path, {line, _}, _config) do
     {:error, "Could not determine module at line #{line} in #{path}"}
   end
 
-  defp set_breakpoint(modules, path, {line, {condition, log_message, hit_count}}) do
+  defp set_breakpoint(modules, path, {line, {condition, log_message, hit_count}}, config) do
     modules_with_breakpoints =
       Enum.reduce(modules, [], fn module, added ->
         case interpret(module, false) do
@@ -2101,7 +2448,7 @@ defmodule ElixirLS.DebugAdapter.Server do
             Output.debugger_console("Setting breakpoint in #{inspect(module)} #{path}:#{line}")
             # no need to handle errors here, it can fail only with {:error, :break_exists}
             :int.break(module, line)
-            update_break_condition(module, line, condition, log_message, hit_count)
+            update_break_condition(module, line, condition, log_message, hit_count, config)
 
             [module | added]
 
@@ -2164,7 +2511,7 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
-  def update_break_condition(module, lines, condition, log_message, hit_count) do
+  def update_break_condition(module, lines, condition, log_message, hit_count, config) do
     lines = List.wrap(lines)
 
     condition = parse_condition(condition)
@@ -2173,10 +2520,12 @@ defmodule ElixirLS.DebugAdapter.Server do
 
     log_message = if log_message not in ["", nil], do: log_message
 
-    register_break_condition(module, lines, condition, log_message, hit_count)
+    register_break_condition(module, lines, condition, log_message, hit_count, config)
   end
 
-  defp register_break_condition(module, lines, condition, log_message, hit_count) do
+  defp register_break_condition(module, lines, condition, log_message, hit_count, %{
+         "request" => "launch"
+       }) do
     case BreakpointCondition.register_condition(module, lines, condition, log_message, hit_count) do
       {:ok, mf} ->
         for line <- lines do
@@ -2187,6 +2536,18 @@ defmodule ElixirLS.DebugAdapter.Server do
         Output.debugger_important(
           "Unable to set condition on a breakpoint in #{module}:#{inspect(lines)}: #{inspect(reason)}"
         )
+    end
+  end
+
+  defp register_break_condition(_module, _lines, condition, log_message, hit_count, %{
+         "request" => "attach"
+       }) do
+    if condition != "true" || log_message || hit_count != 0 do
+      # Module passed to :int.test_at_break has to be available on remote nodes. Otherwise break condition will
+      # always evaluate to false. We cannot easily distribute BreakpointCondition to remote nodes.
+      Output.debugger_important(
+        "Conditional, hit conditional breakpoints and log points are not supported in attach mode"
+      )
     end
   end
 
@@ -2231,8 +2592,31 @@ defmodule ElixirLS.DebugAdapter.Server do
     {__MODULE__, reason, [server]}
   end
 
-  defp update_threads(state = %__MODULE__{}) do
-    pids = :erlang.processes()
+  defp get_snapshot_by_pid do
+    for {pid, function, status, info} <- :int.snapshot(),
+        status not in [:exit, :no_conn],
+        into: %{},
+        do: {pid, {function, status, info}}
+  end
+
+  defp update_threads(state = %__MODULE__{}, snapshot_by_pid \\ get_snapshot_by_pid()) do
+    # status :: idle | running | waiting | break | exit | no_conn
+    # Info :: {} | {Module, Line} | ExitReason
+    snapshot_pids = Map.keys(snapshot_by_pid)
+    local_pids = :erlang.processes()
+
+    pids =
+      case state.config["request"] do
+        "launch" ->
+          # return all processes from local node, make sure interpreted ones are included
+          (local_pids ++ snapshot_pids) |> Enum.uniq()
+
+        "attach" ->
+          # return only interpreted processes from remote node
+          # exclude local interpreted processes
+          snapshot_pids -- local_pids
+      end
+
     {state, thread_ids, new_ids} = ensure_thread_ids(state, pids)
 
     for thread_id <- new_ids do
@@ -2277,15 +2661,46 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
-  defp process_name(process_info) do
-    registered_name = Keyword.get(process_info, :registered_name)
-
-    if registered_name do
-      inspect(registered_name)
+  defp get_process_name(pid, snapshot_by_pid) do
+    try do
+      Process.info(pid)
+    rescue
+      ArgumentError ->
+        # remote process
+        process_name_from_snapshot(Map.fetch!(snapshot_by_pid, pid))
     else
-      {mod, func, arity} = Keyword.fetch!(process_info, :initial_call)
-      "#{inspect(mod)}.#{to_string(func)}/#{arity}"
+      nil -> nil
+      process_info -> process_name_from_info(process_info)
     end
+  end
+
+  defp process_name_from_info(process_info) do
+    # if present registered_name is na atom
+    registered_name = Keyword.fetch(process_info, :registered_name)
+    # OTP 27+ process label may be any term
+    # it's not documented but :proc_lib.get_label reads `:$process_label` key from process dictionary
+    # https://github.com/erlang/otp/blob/601a012837ea0a5c8095bf24223132824177124d/lib/stdlib/src/proc_lib.erl#L876
+    # we have already read it so can get it directly
+    label = process_info |> Keyword.fetch!(:dictionary) |> Keyword.fetch(:"$process_label")
+
+    case {registered_name, label} do
+      {{:ok, registered_name}, {:ok, label}} ->
+        "#{inspect(registered_name)}: #{inspect(label)}"
+
+      {{:ok, registered_name}, _} ->
+        inspect(registered_name)
+
+      {_, {:ok, label}} ->
+        inspect(label)
+
+      _ ->
+        {mod, func, arity} = Keyword.fetch!(process_info, :initial_call)
+        "#{inspect(mod)}.#{to_string(func)}/#{arity}"
+    end
+  end
+
+  defp process_name_from_snapshot({{mod, func, args}, _status, _info}) do
+    "#{inspect(mod)}.#{to_string(func)}/#{length(args)}"
   end
 
   defp schedule_update_threads(state = %__MODULE__{update_threads_ref: old_ref}) do

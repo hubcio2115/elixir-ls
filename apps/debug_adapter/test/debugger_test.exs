@@ -1151,7 +1151,7 @@ defmodule ElixirLS.DebugAdapter.ServerTest do
                        500
 
         assert_receive event(_, "output", %{
-                         "category" => "important",
+                         "category" => "console",
                          "output" => "Failed to obtain meta for pid" <> _
                        })
       end)
@@ -3303,6 +3303,78 @@ defmodule ElixirLS.DebugAdapter.ServerTest do
     end)
   end
 
+  if System.otp_release() |> String.to_integer() >= 27 do
+    @tag :fixture
+    test "returns process label", %{server: server} do
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+
+        assert_receive(
+          response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true})
+        )
+
+        Server.receive_packet(
+          server,
+          launch_req(2, %{
+            "request" => "launch",
+            "type" => "mix_task",
+            "task" => "run",
+            "taskArgs" => ["-e", "MixProject.Some.sleep()"],
+            "projectDir" => File.cwd!()
+          })
+        )
+
+        assert_receive(response(_, 2, "launch", %{}), 5000)
+        assert_receive(event(_, "initialized", %{}))
+
+        Server.receive_packet(server, request(5, "configurationDone", %{}))
+        assert_receive(response(_, 5, "configurationDone", %{}))
+        Process.sleep(1000)
+
+        {:ok, pid} =
+          Task.start(fn ->
+            :proc_lib.set_label("foo")
+
+            receive do
+              :done -> :ok
+            end
+          end)
+
+        Process.monitor(pid)
+
+        send(server, :update_threads)
+        state = :sys.get_state(server)
+
+        thread_id = state.pids_to_thread_ids[pid]
+        assert thread_id
+        assert state.thread_ids_to_pids[thread_id] == pid
+
+        Server.receive_packet(server, request(6, "threads", %{}))
+        assert_receive(response(_, 6, "threads", %{"threads" => threads}), 1_000)
+
+        assert Enum.find(threads, &(&1["id"] == thread_id))["name"] ==
+                 "\"foo\" #{:erlang.pid_to_list(pid)}"
+
+        send(pid, :done)
+
+        receive do
+          {:DOWN, _, _, ^pid, _} -> :ok
+        end
+
+        send(server, :update_threads)
+        state = :sys.get_state(server)
+
+        refute Map.has_key?(state.pids_to_thread_ids, pid)
+        refute Map.has_key?(state.thread_ids_to_pids, thread_id)
+
+        Server.receive_packet(server, request(6, "threads", %{}))
+        assert_receive(response(_, 6, "threads", %{"threads" => threads}), 1_000)
+
+        refute Enum.find(threads, &(&1["id"] == thread_id))
+      end)
+    end
+  end
+
   describe "evaluate" do
     defp gen_watch_expression_packet(seq, expr) do
       %{
@@ -3789,6 +3861,45 @@ defmodule ElixirLS.DebugAdapter.ServerTest do
           _
         )
       )
+
+      assert Process.alive?(server)
+    end)
+  end
+
+  test "source", %{server: server} do
+    in_fixture(__DIR__, "mix_project", fn ->
+      Server.receive_packet(server, initialize_req(1, %{}))
+      assert_receive(response(_, 1, "initialize", _))
+
+      Server.receive_packet(
+        server,
+        %{
+          "arguments" => %{
+            "sourceReference" => 0,
+            "source" => %{"path" => "lib/crash.ex"}
+          },
+          "command" => "source",
+          "seq" => 1,
+          "type" => "request"
+        }
+      )
+
+      assert_receive(%{"body" => %{"content" => "defmodule MixProject.Crash do" <> _}}, 10000)
+
+      Server.receive_packet(
+        server,
+        %{
+          "arguments" => %{
+            "sourceReference" => 0,
+            "source" => %{"path" => "replinput"}
+          },
+          "command" => "source",
+          "seq" => 1,
+          "type" => "request"
+        }
+      )
+
+      assert_receive(%{"body" => %{"content" => ""}}, 10000)
 
       assert Process.alive?(server)
     end)

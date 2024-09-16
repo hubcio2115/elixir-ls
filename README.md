@@ -109,14 +109,15 @@ ElixirLS generally aims to support the last three released versions of Elixir an
 |  OTP Versions   | Elixir Versions | Supports ElixirLS |                          Issue(s)                          |
 | :-------------: | :-------------: | :---------------: | :--------------------------------------------------------: |
 |      any        |     <= 1.12     |        No         |                No support for Code.Fragment                |
-|      22         |       1.12      |        Yes        |         Erlang docs not working (requires EIP 48)          |
+|      22         |    1.12 - 1.13  |        Yes        |         Erlang docs not working (requires EIP 48)          |
 |      23         |   1.12 - 1.14   |        Yes        |                            None                            |
 |      24         |   1.12 - 1.16   |        Yes        |                            None                            |
-|      25         |  1.13.4 - 1.16  |        Yes        |                            None                            |
+|      25         |  1.13.4 - 1.17  |        Yes        |                            None                            |
 | 26.0.0 - 26.0.1 |       any       |        No         | [#886](https://github.com/elixir-lsp/elixir-ls/issues/886) |
-| 26.0.2 - 26.1.2    |  1.14.5 - 1.16  |    *nix only      | [#927](https://github.com/elixir-lsp/elixir-ls/issues/927), [#1023](https://github.com/elixir-lsp/elixir-ls/issues/1023)          |
-|   >= 26.2.0     |  1.14.5 - 1.16  |        Yes        |                            None                            |
-|      any        |     1.15.5      |        Yes        |                Broken formatter [#975](https://github.com/elixir-lsp/elixir-ls/issues/975)                |
+| 26.0.2 - 26.1.2 |  1.14.5 - 1.17  |    *nix only      | [#927](https://github.com/elixir-lsp/elixir-ls/issues/927), [#1023](https://github.com/elixir-lsp/elixir-ls/issues/1023) |
+|   >= 26.2.0     |  1.14.5 - 1.17  |        Yes        |                            None                            |
+|      any        |     1.15.5      |        Yes        |  Broken formatter [#975](https://github.com/elixir-lsp/elixir-ls/issues/975) |
+|      27         |      1.17       |        Yes        |                            None                            |
 
 ### Version management
 
@@ -253,6 +254,47 @@ It may be useful to connect to a running debug adapter node via OTP distribution
 }
 ```
 
+### Attaching to remote nodes
+
+ElixirLS debug adapter is capable of remote debugging OTP cluster nodes. This functionality relies on OTP debugger. In order to attach to a remote node `some@host` a special launch config with request `attach` is needed. The launch config must specify `remoteNode` as well as `cookie` and `name` or `sname` for local DAP node.
+
+```json
+{
+  "type": "mix_task",
+  "name": "attach",
+  "request": "attach",
+  "projectDir": "${workspaceRoot}",
+  "remoteNode": "some@host",
+  "debugAutoInterpretAllModules": false,
+  "debugInterpretModulesPatterns": ["MyApp.*"],
+  "env": {
+    "ELS_ELIXIR_OPTS": "--sname elixir_ls_dap --cookie mysecret"
+  }
+}
+```
+
+#### Troubleshooting
+
+- Ensure that the remote node is accessible and accepting connections
+- Ensure that erlang cookie is correct
+- Ensure that OTP `debugger` application is loadable on remote node. This may require including it in `extra_applications`
+- If connecting to an OTP release, ensure that it is built with `strip_beams` set to `false`. Note that it defaults to `true`
+- Ensure that remote node application has not been compiled with `debug_info` set to `false` via `elixirc_options` or `@compile` attribute
+- Ensure that both source files and compiled beams are available in the project directory
+
+#### Limitations
+
+Remote debugger has several limitations compared to local debugger:
+
+- `dbg` macro breakpoints are not supported
+- conditional breakpoints, hit conditional breakpoints and log points are not supported
+- pausing non interpreted processes is not supported
+- expressions are evaluated on local node
+
+#### Warning
+
+ElixirLS debug adapter interprets modules with [`:int.ni/1`](https://www.erlang.org/doc/apps/debugger/int.html#ni/1) on all connected nodes. It attempts to uninterpret all modules on debug session end but that may not be possible due to loss of connectivity. This may affect production workloads. Use remote debugging with caution.
+
 ## Automatic builds and error reporting
 
 ElixirLS provides automatic builds and error reporting. By default, builds are triggered automatically when files are saved, but you can also enable "autosave" in your IDE to trigger builds as you type. If you prefer to disable automatic builds, you can set the `elixirLS.autoBuild` configuration option to `false`.
@@ -368,36 +410,9 @@ If you get an error like the following immediately on startup:
     ** (EXIT) no process: the process is not alive or there's no process currently associated with the given name, possibly because its application isn't started
 ```
 
-and you installed Elixir and Erlang from the Erlang Solutions repository, you may not have a full installation of Erlang. This can be solved with `sudo apt-get install esl-erlang`. (This was originally reported in [#208](https://github.com/elixir-lsp/elixir-ls/issues/208).)
+and you installed Elixir and Erlang from the Erlang Solutions repository, you may not have a full installation of Erlang. This can be solved with `sudo apt-get install esl-erlang`. (This was originally reported in [#208](https://github.com/elixir-lsp/elixir-ls/issues/208)).
 
-On Fedora Linux, if you only install the Elixir package you will not have a full Erlang installation. This can be fixed by running `sudo dnf install erlang` (This was reported in [#231](https://github.com/elixir-lsp/elixir-ls/issues/231).)
-
-If you are seeing the message "Invalid beam file or no abstract code", you need to make sure that your Mix project is set to use the `elixirc` compiler option `--debug-info`, which can be done by adding the following line to your `mix.exs` `project` section:
-
-```elixir
-elixirc_options: [debug_info: Mix.env() == :dev]
-```
-
-For example:
-
-```elixir
-defmodule MyApp.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :my_app,
-      version: "0.1.0",
-      elixir: "~> 1.11",
-      elixirc_paths: elixirc_paths(Mix.env()),
-      elixirc_options: [debug_info: Mix.env() == :dev],
-    ...
-```
-
-If you are using Emacs with `lsp-mode`, there's a possibility that you have set the
-wrong directory as the project root (especially if that directory does not have
-a `mix.exs` file). To fix that, you should remove the project and re-initialize:
-https://github.com/elixir-lsp/elixir-ls/issues/364#issuecomment-829589139
+On Fedora Linux, if you only install the Elixir package you will not have a full Erlang installation. This can be fixed by running `sudo dnf install erlang` (This was reported in [#231](https://github.com/elixir-lsp/elixir-ls/issues/231)).
 
 ## Known Issues/Limitations
 

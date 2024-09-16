@@ -1,5 +1,46 @@
 ### Unreleased
 
+### v0.23.0: 3 August 2024
+
+#### Improvements
+
+- Added support for attaching with the debug adapter to remote nodes
+- Debug Adapter protocol `source` request implemented
+- Added presentation hints to debug scopes
+- Breakpoints are now annotated as failed if setting them fails
+
+#### Fixes
+
+- Fixed a deadlock in debug adapter when meta process is not alive
+- Removed no longer needed workaround for `:gen_statem` callbacks
+
+### v0.22.1: 10 July 2024
+
+#### Improvements
+
+- Improvements to symbol presentation in document symbols
+- ANSI colors enabled in Debug Adapter
+
+### v0.22.0: 11 June 2024
+
+#### Highlights
+
+- Support for elixir 1.17
+- Support for OTP 27
+
+#### Improvements
+
+- Related information with inferred type is added on diagnostics origination from elixir 1.17 type system
+- Added support for ExDoc autolinking in OTP 27 markdown documentation
+- Debug adapter can display OTP 27 process labels
+- Dialyzer is more strict with option validation
+- Updated vendored dialyxir to 1.4.3
+- Added support for vfox package manager [yeshan333](https://github.com/yeshan333)
+
+#### Fixes
+
+- Fixed a crash in metadata builder when recovering from AST parse error
+
 ### v0.21.3: 22 May 2024
 
 #### Improvements

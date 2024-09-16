@@ -32,6 +32,18 @@ defmodule ElixirLS.DebugAdapter.Protocol do
     end
   end
 
+  defmacro attach_req(seq, args) do
+    quote do
+      request(unquote(seq), "attach", unquote(args))
+    end
+  end
+
+  defmacro source_req(seq, args) do
+    quote do
+      request(unquote(seq), "source", unquote(args))
+    end
+  end
+
   defmacro set_breakpoints_req(seq, source, breakpoints) do
     quote do
       request(unquote(seq), "setBreakpoints", %{
